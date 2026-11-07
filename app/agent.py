@@ -20,6 +20,12 @@ from pydantic_ai import Agent
 from pydantic_ai.exceptions import ModelHTTPError
 from fastmcp import Client
 from pydantic_ai.mcp import MCPToolset, StdioTransport
+from pydantic_ai import (
+    DeferredToolRequests,
+    DeferredToolResults,
+    ToolApproved,
+    ToolDenied,
+)
 from pydantic_ai.messages import ToolCallPart, ToolReturnPart
 from pydantic_ai.models.google import GoogleModel
 from pydantic_ai.models.test import TestModel
@@ -30,7 +36,6 @@ from app.config import MODEL, api_error_message, get_api_key
 
 INSTRUCTIONS = """\
 あなたはAIエンジニアリング講座（AIE2026）の学習支援エージェントです。
-- 用語や講座に固有のことを答える前に、必ず search_glossary で用語集を確認する。
 - 回の内容を聞かれたら get_lecture_summary を使う。
 - 用語集に見つからないことは、推測で断定せず「用語集にはない」と伝える。
 - 回答の最後に、関係する回（第N回）を示す。
@@ -38,9 +43,14 @@ INSTRUCTIONS = """\
 """
 
 # モデルは実行時に渡す（テストではAPIを呼ばない TestModel に差し替えるため）
-agent = Agent(instructions=INSTRUCTIONS)
+agent = Agent(
+    instructions=INSTRUCTIONS,
+    output_type=[str, DeferredToolRequests],
+)
 agent.tool_plain(tools.search_glossary)
 agent.tool_plain(tools.get_lecture_summary)
+agent.tool_plain(tools.make_quiz)
+agent.tool_plain(tools.save_learning_log, requires_approval=True)
 
 # TODO(第3回 演習): tools.py に make_quiz を作り、ここで登録しよう
 
@@ -132,6 +142,26 @@ def main() -> None:
     except ModelHTTPError as e:
         print(api_error_message(e.status_code, str(e.body)[:200]))
         raise SystemExit(1)
+    if isinstance(result.output, DeferredToolRequests):
+        print("学習記録の保存について、利用者の承認が必要です。")
+        for tool_call in result.output.approvals:
+            print(f"ツール名: {tool_call.tool_name}")
+            print(f"保存予定の内容: {tool_call.args}")
+
+        answer = input("この内容を保存しますか？ (y/n): ").strip().lower()
+        approved = answer == "y"
+
+        approvals = {}
+        for tool_call in result.output.approvals:
+            approvals[tool_call.tool_call_id] = (
+                ToolApproved() if approved else ToolDenied("利用者が保存を拒否しました")
+            )
+        result = target.run_sync(
+            message_history=result.all_messages(),
+            deferred_tool_results=DeferredToolResults(approvals=approvals),
+            model=build_model(),
+        )
+
     print(result.output)
     if args.trace:
         print_trace(result)
